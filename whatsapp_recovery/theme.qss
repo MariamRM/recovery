@@ -1,0 +1,79 @@
+QWidget {
+    background: #f3f5f7;
+    color: #1f2933;
+    font-family: "Segoe UI";
+    font-size: 10pt;
+}
+
+QMainWindow {
+    background: #edf1f4;
+}
+
+QFrame#HeaderCard,
+QFrame#SidebarCard,
+QFrame#MessagesCard {
+    background: #ffffff;
+    border: 1px solid #d7dde3;
+    border-radius: 14px;
+}
+
+QLabel#TitleLabel {
+    font-size: 18pt;
+    font-weight: 700;
+    color: #0f5132;
+}
+
+QLabel#MutedLabel {
+    color: #52606d;
+}
+
+QPushButton {
+    background: #0f766e;
+    color: white;
+    border: none;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 600;
+}
+
+QPushButton:hover {
+    background: #115e59;
+}
+
+QPushButton:disabled {
+    background: #94a3b8;
+}
+
+QLineEdit,
+QDateEdit,
+QComboBox,
+QPlainTextEdit,
+QListWidget,
+QTableWidget {
+    background: #fbfcfd;
+    border: 1px solid #c8d2dc;
+    border-radius: 10px;
+    padding: 6px;
+}
+
+QListWidget::item {
+    padding: 8px;
+    border-radius: 8px;
+}
+
+QListWidget::item:selected {
+    background: #d1fae5;
+    color: #134e4a;
+}
+
+QHeaderView::section {
+    background: #e8eef2;
+    color: #334155;
+    padding: 6px;
+    border: none;
+    border-bottom: 1px solid #d7dde3;
+}
+
+QStatusBar {
+    background: #ffffff;
+}
