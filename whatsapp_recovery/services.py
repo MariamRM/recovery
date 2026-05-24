@@ -4,16 +4,40 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import csv
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 from typing import Iterable
+import zlib
+
+from wa_crypt_tools.lib.db.dbfactory import DatabaseFactory
+from wa_crypt_tools.lib.key.keyfactory import KeyFactory
+from wa_crypt_tools.lib.utils import test_decompression
+
+try:
+    from Cryptodome.Cipher import AES
+except ModuleNotFoundError:
+    from Crypto.Cipher import AES
 
 
 SUPPORTED_EXTENSIONS = {".crypt12", ".crypt14", ".crypt15"}
-APP_DATA_DIR = Path(__file__).resolve().parent.parent / "app_data"
+
+
+def _app_data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "WhatsAppBackupReader"
+        return Path.home() / "AppData" / "Local" / "WhatsAppBackupReader"
+    return Path(__file__).resolve().parent.parent / "app_data"
+
+
+APP_DATA_DIR = _app_data_dir()
 DECRYPTED_LIBRARY_DIR = APP_DATA_DIR / "decrypted"
 LIBRARY_INDEX_PATH = APP_DATA_DIR / "backup_library.json"
 
@@ -41,10 +65,15 @@ class MessageRecord:
     media_type: str
     media_name: str
     media_reference: str
+    resolved_media_path: str = ""
 
     @property
     def datetime_value(self) -> datetime | None:
         return timestamp_ms_to_datetime(self.timestamp_ms)
+
+    @property
+    def resolved_media_file(self) -> Path | None:
+        return Path(self.resolved_media_path) if self.resolved_media_path else None
 
 
 @dataclass(slots=True)
@@ -54,6 +83,7 @@ class BackupLibraryEntry:
     display_name: str
     added_at: str
     decrypted_db_path: str = ""
+    media_root_path: str = ""
 
     @property
     def backup_file(self) -> Path:
@@ -62,6 +92,16 @@ class BackupLibraryEntry:
     @property
     def decrypted_db_file(self) -> Path | None:
         return Path(self.decrypted_db_path) if self.decrypted_db_path else None
+
+    @property
+    def media_root_dir(self) -> Path | None:
+        return Path(self.media_root_path) if self.media_root_path else None
+
+
+@dataclass(slots=True)
+class ExportArtifacts:
+    media_count: int = 0
+    media_folder: Path | None = None
 
 
 def validate_backup_file(path: Path) -> str:
@@ -146,6 +186,7 @@ class BackupLibrary:
         backup_path: Path,
         crypt_version: str,
         decrypted_db_path: Path | None = None,
+        media_root_path: Path | None = None,
     ) -> BackupLibraryEntry:
         entries = self.list_entries()
         backup_str = str(backup_path.resolve())
@@ -153,12 +194,15 @@ class BackupLibrary:
         display_name = backup_path.name
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         decrypted_str = str(decrypted_db_path.resolve()) if decrypted_db_path else ""
+        media_root_str = str(media_root_path.resolve()) if media_root_path else ""
 
         if existing:
             existing.crypt_version = crypt_version
             existing.display_name = display_name
             if decrypted_str:
                 existing.decrypted_db_path = decrypted_str
+            if media_root_str:
+                existing.media_root_path = media_root_str
             self.save_entries(entries)
             return existing
 
@@ -168,6 +212,7 @@ class BackupLibrary:
             display_name=display_name,
             added_at=now,
             decrypted_db_path=decrypted_str,
+            media_root_path=media_root_str,
         )
         entries.append(entry)
         self.save_entries(entries)
@@ -209,33 +254,35 @@ def decrypt_backup(backup_path: Path, key_path: Path) -> Path:
     validate_backup_file(backup_path)
     validate_key_file(key_path)
 
-    decrypt_bin = shutil.which("wadecrypt")
-    if not decrypt_bin:
-        raise RecoveryError(
-            "wadecrypt was not found. Install wa-crypt-tools in the active Python environment."
-        )
-
     output_path = backup_path.with_name("msgstore.db")
     if output_path.exists():
         output_path = backup_path.with_name("msgstore.decrypted.db")
 
-    command = [decrypt_bin, str(key_path), str(backup_path), str(output_path)]
     try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        raise RecoveryError(f"Decryption failed to start: {exc}") from exc
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
-        details = stderr or stdout or "Unknown decryption error."
-        raise RecoveryError(f"Decryption failed: {details}")
+        key = KeyFactory.new(str(key_path))
+        with backup_path.open("rb") as encrypted_handle, output_path.open("wb") as decrypted_handle:
+            database = DatabaseFactory.from_file(encrypted_handle)
+            cipher = AES.new(key.get(), AES.MODE_GCM, database.get_iv())
+            output_decrypted: bytearray = database.decrypt(key, encrypted_handle.read())
+            try:
+                z_obj = zlib.decompressobj()
+                output_file = z_obj.decompress(output_decrypted)
+                if not z_obj.eof:
+                    raise RecoveryError("The encrypted database file is truncated or damaged.")
+            except zlib.error:
+                output_file = output_decrypted
+                if not test_decompression(output_file[: io.DEFAULT_BUFFER_SIZE]):
+                    raise RecoveryError(
+                        "Decryption failed. The key may not match the backup, or the backup is empty."
+                    )
+            decrypted_handle.write(output_file)
+            del cipher
+    except RecoveryError:
+        output_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        output_path.unlink(missing_ok=True)
+        raise RecoveryError(f"Decryption failed: {exc}") from exc
 
     if not output_path.exists():
         raise RecoveryError("Decryption reported success, but no SQLite file was produced.")
@@ -246,12 +293,13 @@ def decrypt_backup_to_library(
     backup_path: Path,
     key_path: Path,
     library: BackupLibrary | None = None,
+    media_root_path: Path | None = None,
 ) -> tuple[Path, BackupLibraryEntry]:
     crypt_version = validate_backup_file(backup_path)
     output_path = decrypt_backup(backup_path, key_path)
     library_copy = store_decrypted_copy(output_path, backup_path)
     index = library or BackupLibrary()
-    entry = index.upsert_entry(backup_path, crypt_version, library_copy)
+    entry = index.upsert_entry(backup_path, crypt_version, library_copy, media_root_path)
     return library_copy, entry
 
 
@@ -513,6 +561,84 @@ def filter_messages(
     return filtered
 
 
+def build_media_index(media_root: Path) -> dict[str, list[Path]]:
+    if not media_root.exists():
+        raise RecoveryError("Media folder does not exist.")
+    if not media_root.is_dir():
+        raise RecoveryError("Media folder path must point to a directory.")
+
+    index: dict[str, list[Path]] = {}
+    for path in media_root.rglob("*"):
+        if not path.is_file():
+            continue
+        index.setdefault(path.name.lower(), []).append(path)
+    return index
+
+
+def resolve_media_path(
+    message: MessageRecord,
+    media_root: Path | None,
+    media_index: dict[str, list[Path]] | None = None,
+) -> Path | None:
+    if not media_root:
+        return None
+
+    if message.resolved_media_path:
+        resolved = Path(message.resolved_media_path)
+        if resolved.exists():
+            return resolved
+
+    candidates: list[str] = []
+    for raw_value in (message.media_reference, message.media_name):
+        value = (raw_value or "").strip()
+        if not value:
+            continue
+        candidate_path = Path(value)
+        if candidate_path.is_absolute() and candidate_path.exists():
+            return candidate_path
+        candidates.append(value)
+        if candidate_path.name:
+            candidates.append(candidate_path.name)
+
+    for candidate in candidates:
+        direct = media_root / candidate
+        if direct.exists() and direct.is_file():
+            return direct
+
+    lowered_names = {Path(candidate).name.lower() for candidate in candidates if Path(candidate).name}
+    if media_index:
+        for lowered_name in lowered_names:
+            matches = media_index.get(lowered_name, [])
+            if matches:
+                return matches[0]
+    return None
+
+
+def attach_media_paths(
+    messages: Iterable[MessageRecord],
+    media_root: Path | None,
+    media_index: dict[str, list[Path]] | None = None,
+) -> list[MessageRecord]:
+    attached: list[MessageRecord] = []
+    for message in messages:
+        resolved = resolve_media_path(message, media_root, media_index)
+        attached.append(
+            MessageRecord(
+                message_id=message.message_id,
+                chat_id=message.chat_id,
+                timestamp_ms=message.timestamp_ms,
+                sender=message.sender,
+                direction=message.direction,
+                text=message.text,
+                media_type=message.media_type,
+                media_name=message.media_name,
+                media_reference=message.media_reference,
+                resolved_media_path=str(resolved) if resolved else "",
+            )
+        )
+    return attached
+
+
 def _message_dict(message: MessageRecord) -> dict[str, str | int | None]:
     return {
         "message_id": message.message_id,
@@ -524,21 +650,79 @@ def _message_dict(message: MessageRecord) -> dict[str, str | int | None]:
         "media_type": message.media_type,
         "media_name": message.media_name,
         "media_reference": message.media_reference,
+        "resolved_media_path": message.resolved_media_path,
     }
 
 
-def export_chat_html(chat_title: str, messages: list[MessageRecord], output_path: Path) -> None:
-    rows = []
+def _copy_media_files(
+    messages: list[MessageRecord],
+    output_path: Path,
+) -> tuple[list[str], ExportArtifacts]:
+    media_folder = output_path.parent / f"{output_path.stem}_media"
+    copied_map: dict[str, str] = {}
+    copied_refs: list[str] = []
+    media_count = 0
+
     for message in messages:
+        resolved = message.resolved_media_file
+        if not resolved or not resolved.exists():
+            copied_refs.append("")
+            continue
+
+        source_key = str(resolved.resolve())
+        if source_key in copied_map:
+            copied_refs.append(copied_map[source_key])
+            continue
+
+        media_folder.mkdir(parents=True, exist_ok=True)
+        target_name = safe_filename(resolved.name, "media_file")
+        target_path = media_folder / target_name
+        suffix_counter = 1
+        while target_path.exists() and target_path.resolve() != resolved.resolve():
+            target_path = media_folder / f"{target_path.stem}_{suffix_counter}{target_path.suffix}"
+            suffix_counter += 1
+
+        shutil.copy2(resolved, target_path)
+        relative_ref = target_path.relative_to(output_path.parent).as_posix()
+        copied_map[source_key] = relative_ref
+        copied_refs.append(relative_ref)
+        media_count += 1
+
+    artifacts = ExportArtifacts(media_count=media_count, media_folder=media_folder if media_count else None)
+    return copied_refs, artifacts
+
+
+def export_chat_html(
+    chat_title: str,
+    messages: list[MessageRecord],
+    output_path: Path,
+    include_media_files: bool = False,
+) -> ExportArtifacts:
+    copied_refs = [""] * len(messages)
+    artifacts = ExportArtifacts()
+    if include_media_files:
+        copied_refs, artifacts = _copy_media_files(messages, output_path)
+
+    rows = []
+    for index, message in enumerate(messages):
         row = _message_dict(message)
+        media_value = _html_escape(row["media_name"] or "")
+        reference_value = _html_escape(row["media_reference"] or "")
+        if include_media_files and copied_refs[index]:
+            media_value = f'<a href="{_html_escape(copied_refs[index])}">{media_value or "Open file"}</a>'
+            reference_value = f'<a href="{_html_escape(copied_refs[index])}">{_html_escape(copied_refs[index])}</a>'
+        elif row["resolved_media_path"]:
+            resolved_name = Path(str(row["resolved_media_path"])).name
+            media_value = _html_escape(row["media_name"] or resolved_name)
+            reference_value = _html_escape(str(row["resolved_media_path"]))
         rows.append(
             "<tr>"
             f"<td>{_html_escape(row['timestamp'] or '')}</td>"
             f"<td>{_html_escape(row['sender'] or '')}</td>"
             f"<td>{_html_escape(row['direction'] or '')}</td>"
             f"<td>{_html_escape(row['text'] or '')}</td>"
-            f"<td>{_html_escape(row['media_name'] or '')}</td>"
-            f"<td>{_html_escape(row['media_reference'] or '')}</td>"
+            f"<td>{media_value}</td>"
+            f"<td>{reference_value}</td>"
             "</tr>"
         )
 
@@ -578,9 +762,19 @@ def export_chat_html(chat_title: str, messages: list[MessageRecord], output_path
 </html>
 """
     output_path.write_text(html, encoding="utf-8")
+    return artifacts
 
 
-def export_chat_csv(messages: list[MessageRecord], output_path: Path) -> None:
+def export_chat_csv(
+    messages: list[MessageRecord],
+    output_path: Path,
+    include_media_files: bool = False,
+) -> ExportArtifacts:
+    copied_refs = [""] * len(messages)
+    artifacts = ExportArtifacts()
+    if include_media_files:
+        copied_refs, artifacts = _copy_media_files(messages, output_path)
+
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
@@ -594,16 +788,33 @@ def export_chat_csv(messages: list[MessageRecord], output_path: Path) -> None:
                 "media_type",
                 "media_name",
                 "media_reference",
+                "resolved_media_path",
+                "exported_media_path",
             ],
         )
         writer.writeheader()
-        for message in messages:
-            writer.writerow(_message_dict(message))
+        for index, message in enumerate(messages):
+            row = _message_dict(message)
+            row["exported_media_path"] = copied_refs[index]
+            writer.writerow(row)
+    return artifacts
 
 
-def export_chat_json(messages: list[MessageRecord], output_path: Path) -> None:
+def export_chat_json(
+    messages: list[MessageRecord],
+    output_path: Path,
+    include_media_files: bool = False,
+) -> ExportArtifacts:
+    copied_refs = [""] * len(messages)
+    artifacts = ExportArtifacts()
+    if include_media_files:
+        copied_refs, artifacts = _copy_media_files(messages, output_path)
+
     data = [_message_dict(message) for message in messages]
+    for index, row in enumerate(data):
+        row["exported_media_path"] = copied_refs[index]
     output_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return artifacts
 
 
 def _html_escape(value: str) -> str:

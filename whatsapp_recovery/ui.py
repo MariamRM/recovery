@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QDate, Qt
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import QDate, Qt, QUrl
+from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtPrintSupport import QPrinter
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -40,6 +40,8 @@ from whatsapp_recovery.services import (
     RecoveryError,
     WhatsAppDatabase,
     adb_status,
+    attach_media_paths,
+    build_media_index,
     decrypt_backup_to_library,
     export_chat_csv,
     export_chat_html,
@@ -76,12 +78,15 @@ class RecoveryMainWindow(QMainWindow):
         self.backup_path_input = QLineEdit()
         self.backup_folder_input = QLineEdit()
         self.key_path_input = QLineEdit()
+        self.media_folder_input = QLineEdit()
         self.folder_backup_combo = QComboBox()
         self.library_backup_combo = QComboBox()
         self.crypt_version_label = QLabel("No backup selected")
         self.crypt_version_label.setObjectName("MutedLabel")
         self.device_status_label = QLabel("ADB status not checked yet")
         self.device_status_label.setObjectName("MutedLabel")
+        self.media_status_label = QLabel("No media folder selected. Voice notes and PDF attachments will stay as references only.")
+        self.media_status_label.setObjectName("MutedLabel")
 
         self.chat_filter_input = QLineEdit()
         self.chat_list = QListWidget()
@@ -94,6 +99,8 @@ class RecoveryMainWindow(QMainWindow):
         self.chat_header_label.setObjectName("TitleLabel")
         self.chat_meta_label = QLabel("Decrypt a backup to start browsing messages.")
         self.chat_meta_label.setObjectName("MutedLabel")
+        self.media_index_root: Path | None = None
+        self.media_index: dict[str, list[Path]] | None = None
 
         self._build_ui()
         self._bind_events()
@@ -111,6 +118,10 @@ class RecoveryMainWindow(QMainWindow):
         load_saved_action = QAction("Load Saved Backup", self)
         load_saved_action.triggered.connect(self.load_selected_library_backup)
         toolbar.addAction(load_saved_action)
+
+        open_media_action = QAction("Open Selected Media", self)
+        open_media_action.triggered.connect(self.open_selected_media)
+        toolbar.addAction(open_media_action)
 
         export_action = QAction("Export Current Chat", self)
         export_action.triggered.connect(self.export_current_chat)
@@ -156,6 +167,8 @@ class RecoveryMainWindow(QMainWindow):
         form.addRow("Saved Library", self._library_row())
         form.addRow("Backup File", backup_row)
         form.addRow("Key File", key_row)
+        form.addRow("Media Folder", self._media_row())
+        form.addRow("Media Status", self.media_status_label)
         form.addRow("Detected Version", self.crypt_version_label)
         form.addRow("ADB / USB Status", self._device_row())
 
@@ -164,10 +177,13 @@ class RecoveryMainWindow(QMainWindow):
         decrypt_button.clicked.connect(self.decrypt_and_load)
         load_saved_button = QPushButton("Load Saved Backup")
         load_saved_button.clicked.connect(self.load_selected_library_backup)
+        open_media_button = QPushButton("Open Selected Media")
+        open_media_button.clicked.connect(self.open_selected_media)
         check_adb_button = QPushButton("Check Device Status")
         check_adb_button.clicked.connect(self.refresh_adb_status)
         actions.addWidget(decrypt_button)
         actions.addWidget(load_saved_button)
+        actions.addWidget(open_media_button)
         actions.addWidget(check_adb_button)
         actions.addStretch(1)
 
@@ -286,6 +302,18 @@ class RecoveryMainWindow(QMainWindow):
         layout.addWidget(refresh_button)
         return container
 
+    def _media_row(self) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self.media_folder_input.setPlaceholderText("Select the WhatsApp Media folder to keep voices and PDFs...")
+        browse_button = QPushButton("Browse Media")
+        browse_button.clicked.connect(self.select_media_folder)
+        layout.addWidget(self.media_folder_input, 1)
+        layout.addWidget(browse_button)
+        return container
+
     def _device_row(self) -> QWidget:
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -298,6 +326,7 @@ class RecoveryMainWindow(QMainWindow):
         self.chat_list.currentItemChanged.connect(self.on_chat_selected)
         self.folder_backup_combo.currentIndexChanged.connect(self.on_scanned_backup_selected)
         self.library_backup_combo.currentIndexChanged.connect(self.on_library_backup_selected)
+        self.message_table.itemDoubleClicked.connect(lambda _: self.open_selected_media())
         self.search_input.textChanged.connect(self.refresh_message_table)
         self.start_date_input.dateChanged.connect(self.refresh_message_table)
         self.end_date_input.dateChanged.connect(self.refresh_message_table)
@@ -339,6 +368,18 @@ class RecoveryMainWindow(QMainWindow):
         try:
             validate_key_file(Path(path))
             self.statusBar().showMessage(f"Key selected: {path}")
+        except RecoveryError as exc:
+            self.show_error(str(exc))
+
+    def select_media_folder(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select WhatsApp Media Folder", "")
+        if not path:
+            return
+        media_root = Path(path)
+        try:
+            self._set_media_folder(media_root)
+            self._persist_media_folder_for_current_backup(media_root)
+            self.refresh_message_table()
         except RecoveryError as exc:
             self.show_error(str(exc))
 
@@ -424,12 +465,91 @@ class RecoveryMainWindow(QMainWindow):
         else:
             self.backup_path_input.setText(entry.backup_path)
             self.crypt_version_label.setText(entry.crypt_version)
+        if entry.media_root_path:
+            media_root = Path(entry.media_root_path)
+            if media_root.exists():
+                try:
+                    self._set_media_folder(media_root)
+                except RecoveryError as exc:
+                    self.show_error(str(exc))
+            else:
+                self._clear_media_folder()
+                self.media_folder_input.setText(entry.media_root_path)
+                self.media_status_label.setText("Saved media folder is missing. Re-select it to keep voices and PDFs.")
+        else:
+            self._clear_media_folder()
 
     def _set_selected_backup(self, backup_path: Path) -> None:
         crypt_version = validate_backup_file(backup_path)
         self.backup_path_input.setText(str(backup_path))
         self.crypt_version_label.setText(crypt_version)
+        matching_entry = next(
+            (entry for entry in self.library_entries if entry.backup_path == str(backup_path.resolve())),
+            None,
+        )
+        if matching_entry and matching_entry.media_root_path:
+            media_root = Path(matching_entry.media_root_path)
+            if media_root.exists():
+                self._set_media_folder(media_root)
+            else:
+                self._clear_media_folder()
+                self.media_folder_input.setText(matching_entry.media_root_path)
+                self.media_status_label.setText("Saved media folder is missing. Re-select it to keep voices and PDFs.")
+        else:
+            self._clear_media_folder()
         self.statusBar().showMessage(f"Backup selected: {backup_path}")
+
+    def _set_media_folder(self, media_root: Path) -> None:
+        self.media_folder_input.setText(str(media_root))
+        self.media_index = build_media_index(media_root)
+        self.media_index_root = media_root
+        self.media_status_label.setText(
+            f"Media folder indexed. Linked files like voice notes and PDFs can now be opened and exported."
+        )
+        self.statusBar().showMessage(f"Media folder selected: {media_root}")
+
+    def _clear_media_folder(self) -> None:
+        self.media_folder_input.clear()
+        self.media_index = None
+        self.media_index_root = None
+        self.media_status_label.setText(
+            "No media folder selected. Voice notes and PDF attachments will stay as references only."
+        )
+
+    def _persist_media_folder_for_current_backup(self, media_root: Path) -> None:
+        backup_text = self.backup_path_input.text().strip()
+        if not backup_text:
+            return
+        backup_path = Path(backup_text)
+        try:
+            crypt_version = validate_backup_file(backup_path)
+        except RecoveryError:
+            return
+        self.library.upsert_entry(backup_path, crypt_version, media_root_path=media_root)
+        self.refresh_library_dropdown()
+
+    def _current_media_root(self) -> Path | None:
+        media_text = self.media_folder_input.text().strip()
+        if not media_text:
+            return None
+        media_root = Path(media_text)
+        if not media_root.exists() or not media_root.is_dir():
+            return None
+        return media_root
+
+    def _current_media_index(self) -> dict[str, list[Path]] | None:
+        media_root = self._current_media_root()
+        if media_root is None:
+            return None
+        if self.media_index_root != media_root or self.media_index is None:
+            self._set_media_folder(media_root)
+        return self.media_index
+
+    def _messages_with_media(self, messages: list[MessageRecord]) -> list[MessageRecord]:
+        media_root = self._current_media_root()
+        if media_root is None:
+            return messages
+        return attach_media_paths(messages, media_root, self._current_media_index())
 
     def refresh_adb_status(self) -> None:
         status = adb_status()
@@ -441,7 +561,12 @@ class RecoveryMainWindow(QMainWindow):
         key_path = Path(self.key_path_input.text().strip())
 
         try:
-            db_path, library_entry = decrypt_backup_to_library(backup_path, key_path, self.library)
+            db_path, library_entry = decrypt_backup_to_library(
+                backup_path,
+                key_path,
+                self.library,
+                self._current_media_root(),
+            )
             self._load_database(db_path, library_entry)
         except RecoveryError as exc:
             self.show_error(str(exc))
@@ -537,7 +662,7 @@ class RecoveryMainWindow(QMainWindow):
         self.refresh_message_table()
 
     def refresh_message_table(self) -> None:
-        messages = self.state.current_messages or []
+        messages = self._messages_with_media(self.state.current_messages or [])
         query = self.search_input.text()
         start_date = self._date_edit_to_datetime(self.start_date_input)
         end_date = self._date_edit_to_datetime(self.end_date_input)
@@ -551,11 +676,13 @@ class RecoveryMainWindow(QMainWindow):
                 message.direction,
                 message.text,
                 message.media_name or message.media_type,
-                message.media_reference,
+                message.resolved_media_path or message.media_reference,
             ]
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column_index == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, message.resolved_media_path)
                 if column_index == 2:
                     alignment = Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
                     item.setTextAlignment(int(alignment))
@@ -588,21 +715,27 @@ class RecoveryMainWindow(QMainWindow):
 
         output_path = Path(path)
         filtered = filter_messages(
-            self.state.current_messages,
+            self._messages_with_media(self.state.current_messages),
             self.search_input.text(),
             self._date_edit_to_datetime(self.start_date_input),
             self._date_edit_to_datetime(self.end_date_input),
         )
+        include_media_files = self._current_media_root() is not None
 
         try:
             if export_type == "html":
-                export_chat_html(self.state.current_chat.title, filtered, output_path)
+                artifacts = export_chat_html(
+                    self.state.current_chat.title,
+                    filtered,
+                    output_path,
+                    include_media_files=include_media_files,
+                )
             elif export_type == "csv":
-                export_chat_csv(filtered, output_path)
+                artifacts = export_chat_csv(filtered, output_path, include_media_files=include_media_files)
             elif export_type == "json":
-                export_chat_json(filtered, output_path)
+                artifacts = export_chat_json(filtered, output_path, include_media_files=include_media_files)
             elif export_type == "pdf":
-                self._export_pdf(output_path, filtered)
+                artifacts = self._export_pdf(output_path, filtered, include_media_files)
             else:
                 raise RecoveryError(f"Unsupported export type: {export_type}")
         except RecoveryError as exc:
@@ -612,11 +745,24 @@ class RecoveryMainWindow(QMainWindow):
             self.show_error(f"Export failed: {exc}")
             return
 
-        self.statusBar().showMessage(f"Exported {len(filtered)} messages to {output_path}")
+        message = f"Exported {len(filtered)} messages to {output_path}"
+        if artifacts.media_count:
+            message += f" with {artifacts.media_count} media file(s) in {artifacts.media_folder}"
+        self.statusBar().showMessage(message)
 
-    def _export_pdf(self, output_path: Path, messages: list[MessageRecord]) -> None:
+    def _export_pdf(
+        self,
+        output_path: Path,
+        messages: list[MessageRecord],
+        include_media_files: bool,
+    ):
         temp_html = output_path.with_suffix(".html")
-        export_chat_html(self.state.current_chat.title, messages, temp_html)
+        artifacts = export_chat_html(
+            self.state.current_chat.title,
+            messages,
+            temp_html,
+            include_media_files=include_media_files,
+        )
         html = temp_html.read_text(encoding="utf-8")
 
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
@@ -628,6 +774,20 @@ class RecoveryMainWindow(QMainWindow):
         document.print(printer)
 
         temp_html.unlink(missing_ok=True)
+        return artifacts
+
+    def open_selected_media(self) -> None:
+        current_row = self.message_table.currentRow()
+        if current_row < 0:
+            self.show_error("Select a message row first.")
+            return
+        item = self.message_table.item(current_row, 0)
+        media_path = item.data(Qt.ItemDataRole.UserRole) if item else ""
+        if not media_path:
+            self.show_error("The selected message does not have a resolved local media file.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(media_path)):
+            self.show_error("Failed to open the selected media file.")
 
     def _date_edit_to_datetime(self, widget: QDateEdit) -> datetime:
         date = widget.date()
