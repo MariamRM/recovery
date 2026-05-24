@@ -39,10 +39,12 @@ from whatsapp_recovery.services import (
     MessageRecord,
     RecoveryError,
     WhatsAppDatabase,
+    adb_root_status,
     adb_status,
     attach_media_paths,
     build_media_index,
     decrypt_backup_to_library,
+    extract_whatsapp_key_via_adb_root,
     export_chat_csv,
     export_chat_html,
     export_chat_json,
@@ -119,6 +121,10 @@ class RecoveryMainWindow(QMainWindow):
         load_saved_action.triggered.connect(self.load_selected_library_backup)
         toolbar.addAction(load_saved_action)
 
+        auto_key_action = QAction("Auto Detect Key", self)
+        auto_key_action.triggered.connect(self.auto_detect_key)
+        toolbar.addAction(auto_key_action)
+
         open_media_action = QAction("Open Selected Media", self)
         open_media_action.triggered.connect(self.open_selected_media)
         toolbar.addAction(open_media_action)
@@ -177,12 +183,15 @@ class RecoveryMainWindow(QMainWindow):
         decrypt_button.clicked.connect(self.decrypt_and_load)
         load_saved_button = QPushButton("Load Saved Backup")
         load_saved_button.clicked.connect(self.load_selected_library_backup)
+        auto_key_button = QPushButton("Auto Detect Key")
+        auto_key_button.clicked.connect(self.auto_detect_key)
         open_media_button = QPushButton("Open Selected Media")
         open_media_button.clicked.connect(self.open_selected_media)
         check_adb_button = QPushButton("Check Device Status")
         check_adb_button.clicked.connect(self.refresh_adb_status)
         actions.addWidget(decrypt_button)
         actions.addWidget(load_saved_button)
+        actions.addWidget(auto_key_button)
         actions.addWidget(open_media_button)
         actions.addWidget(check_adb_button)
         actions.addStretch(1)
@@ -552,9 +561,27 @@ class RecoveryMainWindow(QMainWindow):
         return attach_media_paths(messages, media_root, self._current_media_index())
 
     def refresh_adb_status(self) -> None:
-        status = adb_status()
+        adb_message = adb_status()
+        root_message = adb_root_status()
+        status = f"{adb_message} {root_message}"
         self.device_status_label.setText(status)
         self.statusBar().showMessage(status)
+
+    def auto_detect_key(self) -> None:
+        try:
+            key_path = extract_whatsapp_key_via_adb_root()
+            self.key_path_input.setText(str(key_path))
+            validate_key_file(key_path)
+        except RecoveryError as exc:
+            self.show_error(str(exc))
+            self.device_status_label.setText(str(exc))
+            return
+
+        success_message = f"WhatsApp key extracted automatically to {key_path}"
+        self.device_status_label.setText(
+            "ADB authorized. Root access is available and the WhatsApp key was extracted successfully."
+        )
+        self.statusBar().showMessage(success_message)
 
     def decrypt_and_load(self) -> None:
         backup_path = Path(self.backup_path_input.text().strip())

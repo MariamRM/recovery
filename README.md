@@ -28,6 +28,11 @@ The original single-backup MVP is still supported:
 
 USB key extraction and rooted-device workflows are intentionally left as future work. The app only checks ADB availability/device authorization status for now.
 
+The desktop app now also includes a root-only ADB key extraction attempt:
+
+- if the phone is authorized over ADB and rooted, the app can try to read the WhatsApp key automatically
+- if the phone is authorized but not rooted, the app will clearly fall back to manual key selection
+
 ## Safety Boundaries
 
 The tool is designed for local backup inspection and export only. It does not:
@@ -70,6 +75,15 @@ Without the media folder, the app still exports message text and raw media refer
 ## Notes About Decryption
 
 The app uses the `wa-crypt-tools` Python library directly. End users do not need a separate `wadecrypt.exe` install if you build the packaged desktop executable.
+
+## ADB And Key Detection
+
+The `Auto Detect Key` button is root-only.
+
+- `USB debugging enabled` and `Trust this computer` are enough for ADB device detection
+- they are not enough to read WhatsApp's private key on a normal non-rooted phone
+- automatic key extraction only works when `su` root access is available on the device
+- otherwise the app will show a manual-key-required message and you should choose the key file yourself
 
 The decrypted SQLite file is first written next to the encrypted backup as:
 

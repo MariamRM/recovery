@@ -39,6 +39,7 @@ def _app_data_dir() -> Path:
 
 APP_DATA_DIR = _app_data_dir()
 DECRYPTED_LIBRARY_DIR = APP_DATA_DIR / "decrypted"
+KEY_LIBRARY_DIR = APP_DATA_DIR / "keys"
 LIBRARY_INDEX_PATH = APP_DATA_DIR / "backup_library.json"
 
 
@@ -131,6 +132,7 @@ def safe_filename(value: str, fallback: str = "chat_export") -> str:
 def ensure_app_data_dirs() -> None:
     APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     DECRYPTED_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    KEY_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def scan_backup_folder(folder_path: Path) -> list[Path]:
@@ -248,6 +250,120 @@ def adb_status() -> str:
     if unauthorized:
         return "Device detected, but USB debugging authorization is still pending."
     return "ADB available. Device state is not ready."
+
+
+def _require_adb() -> str:
+    adb_path = shutil.which("adb")
+    if not adb_path:
+        raise RecoveryError("ADB not found on PATH.")
+    return adb_path
+
+
+def _run_adb_command(
+    args: list[str],
+    *,
+    timeout: int = 20,
+    text: bool = True,
+    check: bool = True,
+):
+    adb_path = _require_adb()
+    result = subprocess.run(
+        [adb_path, *args],
+        capture_output=True,
+        text=text,
+        timeout=timeout,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        stderr = result.stderr.strip() if text and result.stderr else ""
+        stdout = result.stdout.strip() if text and result.stdout else ""
+        details = stderr or stdout or "Unknown ADB error."
+        raise RecoveryError(f"ADB command failed: {details}")
+    return result
+
+
+def ensure_authorized_device() -> None:
+    result = _run_adb_command(["devices"], timeout=10)
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        raise RecoveryError("No Android device detected over ADB.")
+
+    device_lines = lines[1:]
+    authorized = [line for line in device_lines if "\tdevice" in line]
+    unauthorized = [line for line in device_lines if "\tunauthorized" in line]
+
+    if authorized:
+        return
+    if unauthorized:
+        raise RecoveryError("Device is connected but USB debugging authorization is still pending.")
+    raise RecoveryError("ADB found a device, but it is not in a usable state.")
+
+
+def adb_root_status() -> str:
+    try:
+        ensure_authorized_device()
+        result = _run_adb_command(["shell", "su", "-c", "id"], timeout=10, check=False)
+    except RecoveryError as exc:
+        return str(exc)
+
+    combined = ""
+    if result.stdout:
+        combined += result.stdout
+    if result.stderr:
+        combined += f"\n{result.stderr}"
+
+    if result.returncode == 0 and "uid=0" in combined:
+        return "ADB authorized. Root access is available for automatic key extraction."
+    return "ADB authorized, but root access is not available. Manual key file selection is required."
+
+
+def _detect_remote_whatsapp_key_path() -> tuple[str, str]:
+    candidates = [
+        ("com.whatsapp", "/data/data/com.whatsapp/files/key"),
+        ("com.whatsapp.w4b", "/data/data/com.whatsapp.w4b/files/key"),
+    ]
+    for package_name, remote_path in candidates:
+        result = _run_adb_command(
+            ["shell", "su", "-c", f"test -f {remote_path} && echo FOUND"],
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0 and "FOUND" in (result.stdout or ""):
+            return package_name, remote_path
+    raise RecoveryError(
+        "No WhatsApp key file was found with root access. If this device is not rooted, select the key file manually."
+    )
+
+
+def extract_whatsapp_key_via_adb_root() -> Path:
+    ensure_app_data_dirs()
+    ensure_authorized_device()
+
+    root_check = _run_adb_command(["shell", "su", "-c", "id"], timeout=10, check=False)
+    combined = ""
+    if root_check.stdout:
+        combined += root_check.stdout
+    if root_check.stderr:
+        combined += f"\n{root_check.stderr}"
+    if root_check.returncode != 0 or "uid=0" not in combined:
+        raise RecoveryError(
+            "Automatic key extraction is not available on non-rooted devices. Please provide the key file manually."
+        )
+
+    package_name, remote_key_path = _detect_remote_whatsapp_key_path()
+    result = _run_adb_command(
+        ["exec-out", "su", "-c", f"cat {remote_key_path}"],
+        timeout=20,
+        text=False,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout:
+        raise RecoveryError("Failed to read the WhatsApp key from the rooted device.")
+
+    key_path = KEY_LIBRARY_DIR / f"{package_name.replace('.', '_')}_key"
+    key_path.write_bytes(result.stdout)
+    validate_key_file(key_path)
+    return key_path
 
 
 def decrypt_backup(backup_path: Path, key_path: Path) -> Path:
