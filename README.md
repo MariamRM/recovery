@@ -117,6 +117,24 @@ dist/WhatsAppBackupReader.exe
 
 You can share that `.exe` directly with other Windows users. They do not need Python installed.
 
+## GitHub Releases
+
+The repository includes a GitHub Actions workflow at `.github/workflows/release.yml`.
+
+- Every push to `main` builds the Windows app and uploads the `.exe` and `.zip` as workflow artifacts.
+- Pushing a version tag like `v1.0.0` also creates a GitHub Release automatically and attaches:
+  - `WhatsAppBackupReader.exe`
+  - `WhatsAppBackupReader-win64.zip`
+
+Example release flow:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+After that, the downloadable files appear in the repo's Releases page.
+
 ## Project Layout
 
 ```text
